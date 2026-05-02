@@ -123,7 +123,7 @@ The widget connects to Claude.ai using the same browser session you're already l
 
 ## Configuration
 
-The widget manages its own config at `%LOCALAPPDATA%\Claude Usage\config.json`. Most users never need to edit it; for power users, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). Notable options:
+The widget manages its own config at `%LOCALAPPDATA%\Claude Usage\config.json`. Most users never need to edit it. Notable options:
 
 ```jsonc
 {
@@ -145,7 +145,7 @@ Requirements: Python 3.11+, [PyInstaller](https://pyinstaller.org/), [Inno Setup
 
 Output: `releases/ClaudeUsage-Setup.exe`. The script handles PyInstaller, copies the guide, runs Inno Setup, and zips the Chrome extension.
 
-For architecture details (single-file Python source, Win32 integration, DWM rounded corners, etc.), see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The widget is a single-file Python source (`src/widget.pyw`) using tkinter for the UI plus Win32 ctypes calls for taskbar integration (`ITaskbarList3` for the progress overlay, `DwmSetWindowAttribute` for rounded corners, `Shell_NotifyIcon` for toast notifications).
 
 ## Known behaviors
 
