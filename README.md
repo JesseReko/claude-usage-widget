@@ -13,6 +13,18 @@
 
 A lightweight desktop tool that shows your **Claude.ai session limit, weekly limit and Sonnet limit** as live progress bars so you never get cut off mid-conversation. It is **designed to sit on a free spot of the Windows 11 taskbar** in its compact **essential mode**: low profile, never overflows the screen, never blocks your work. The position you choose is remembered across restarts, so once you place it you never have to touch it again.
 
+## Features at a glance
+
+- **Lives on the taskbar** in a compact essential mode, or as a full window when you want the detail
+- **Three live usage bars:** session (5h), weekly (7d) and Sonnet (7d), each with a reset countdown
+- **Multi-bar essential row:** show one, two or three bars side by side and pick which ones from the menu
+- **Refresh countdown** shown as a quiet pulsing dot or as a numeric value, your choice
+- **Threshold toast notifications** when session usage crosses 25 / 50 / 75 / 90 / 95 / 100 %
+- **Win11 taskbar progress overlay** under the app icon, colour-coded by usage
+- **Always on top, never steals focus,** position remembered across restarts and updates
+- **One-click setup** with the companion browser extension, or a manual fallback
+- **Auto-update** from GitHub, **three languages** (EN / IT / JA), **no telemetry**
+
 ## Why this widget
 
 If you use **Claude.ai** for hours every day (developers on Claude Code, writers, researchers, students), you have probably hit the dreaded *"You've reached your usage limit"* message at the worst possible moment. Anthropic does not surface your usage anywhere while you work: you have to dig into a settings page.
@@ -45,14 +57,7 @@ Essential mode is flexible. Show just the session bar for the smallest footprint
 - **Pick the bars you want.** The **Essential bars** menu lets you choose which bars appear in the collapsed row (session is always shown; weekly and Sonnet are optional). Bar widths adapt automatically and the minimum window width grows to keep everything readable.
 - **Hamburger menu** on the multi-bar row: a small button opens the settings menu and keeps the reset labels clear of the bottom-right controls.
 - **Reduced reset labels** under every bar (`reset 51min`, `reset 2d 8h`) so you always know when each one refreshes, even in the tightest layout.
-
-### A pulsing dot tells you when the next refresh lands
-
-By default the countdown to the next data refresh is shown as a small **green dot on the right edge of the session bar**. It stays calm, then gently pulses as the refresh approaches and flashes when the data updates. No numbers, no clutter, just a quiet heartbeat that tells you the widget is live.
-
-![The green sync dot pulsing as the next refresh approaches](docs/images/sync-dot.gif)
-
-Prefer exact numbers? Switch **Countdown** to **Full** in the menu and the time-to-refresh is shown as text instead. You can also toggle **Sync time** on or off to show or hide the timestamp of the last successful update.
+- **Refresh countdown, your way.** The time to the next data refresh is shown as a quiet pulsing dot on the session bar (default), or as a numeric value if you switch **Countdown** to **Full**. A **Sync time** toggle shows or hides the timestamp of the last update.
 
 ## A full view when you want the detail
 
