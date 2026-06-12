@@ -109,6 +109,7 @@ DOT_W    = '#d0d0d0'
 DOT_W_H  = '#ffffff'
 DOT_W_D  = '#a0a09e'
 DOT_GREEN   = '#6BC275'  # pre-refresh breathing dot (matches lbl_info green)
+CREDIT   = '#5BA86A'     # API credits bar accent
 PCT_FG   = '#ffffff'
 MENU_BG  = '#2c2c2a'
 
@@ -116,7 +117,7 @@ MENU_BG  = '#2c2c2a'
 APP_VERSION = '2.8.44'
 
 # ─── Auto-update ────────────────────────────────────
-UPDATE_REPO = 'niccolo-sabato/claude-usage-widget'
+UPDATE_REPO = 'JesseReko/claude-usage-widget'
 UPDATE_API_URL = f'https://api.github.com/repos/{UPDATE_REPO}/releases/latest'
 UPDATE_RELEASES_URL = f'https://github.com/{UPDATE_REPO}/releases'
 UPDATE_ASSET_NAME = 'ClaudeUsage-Setup.exe'
@@ -125,8 +126,8 @@ UPDATE_STARTUP_DELAY_MS = 10_000          # check 10s after widget ready
 UPDATE_CHANGELOG_MAX_CHARS = 1400         # truncate release body shown in dialog
 
 # ─── Layout ──────────────────────────────────────────
-DEF_W    = 280
-MIN_W    = 210
+DEF_W    = 160
+MIN_W    = 120
 MIN_H_E  = 46   # essential mode minimum height
 MIN_H_N  = 90   # normal mode minimum height
 PAD      = 12
@@ -513,6 +514,10 @@ LANG = {
         'dlg_interval_label': 'Interval in seconds (minimum 10):',
         'dlg_interval_invalid': 'Enter a number between 10 and 3600',
         'dlg_save': 'Save',
+        'menu_dock': 'Dock to taskbar',
+        'menu_undock': 'Undock from taskbar',
+        'menu_admin_key': 'API key…',
+        'menu_credit_balance': 'Edit credit balance…',
         'menu_quit': 'Quit',
         'menu_language': 'Language',
         'menu_check_updates': 'Check for updates\u2026',
@@ -803,6 +808,22 @@ def pill(cv, x, y, w, h, color):
     cv.create_oval(x + w - h, y, x + w, y + h, fill=color, outline=color, width=1)
     if w > h:
         cv.create_rectangle(x + r, y, x + w - r, y + h, fill=color, outline=color, width=0)
+
+
+def pill_gradient(cv, x, y, w, h, c1, c2):
+    """Gradient-filled pill (c1=top, c2=bottom) via horizontal scan lines."""
+    if w < 2 or h < 1:
+        return
+    r = h / 2
+    for i in range(h):
+        t = i / max(h - 1, 1)
+        color = _lerp_hex(c1, c2, t)
+        dy = i - r + 0.5
+        cap_w = math.sqrt(max(0.0, r * r - dy * dy))
+        lx = x + r - cap_w
+        rx = x + w - r + cap_w
+        if rx > lx:
+            cv.create_line(lx, y + i, rx, y + i, fill=color, width=1)
 
 
 _MD_INLINE_RE = re.compile(r'(\*\*[^*\n]+?\*\*|`[^`\n]+?`|~~[^~\n]+?~~)')
@@ -1189,6 +1210,52 @@ def fetch_usage(cfg):
         raise RuntimeError(f'invalid response: {e}')
 
 
+def fetch_api_credits(admin_api_key):
+    """Fetch total API spend for the current billing period.
+
+    Uses the Anthropic Admin API cost report endpoint. Returns
+    (spend_usd: float, period_end: str|None). Raises on failure.
+    """
+    result = subprocess.run(
+        ['curl', '-s',
+         '-H', f'x-api-key: {admin_api_key}',
+         '-H', 'anthropic-version: 2023-06-01',
+         'https://api.anthropic.com/v1/organizations/cost_report/messages'],
+        capture_output=True, text=True, timeout=20,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'curl: {result.stderr.strip()}')
+    body = result.stdout.strip()
+    if not body:
+        raise RuntimeError('Empty response from credits API')
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f'Invalid JSON: {e}')
+    if isinstance(data, dict) and 'error' in data:
+        err = data['error']
+        msg = err.get('message', str(err)) if isinstance(err, dict) else str(err)
+        raise PermissionError(msg)
+    # Extract total spend — try several response shapes
+    spend = None
+    if 'total_cost' in data:
+        spend = float(data['total_cost'])
+    elif isinstance(data.get('total'), dict):
+        spend = float(data['total'].get('cost', 0))
+    elif isinstance(data.get('data'), list):
+        spend = sum(float(item.get('cost', 0)) for item in data['data'])
+    if spend is None:
+        raise RuntimeError('Could not parse spend from response')
+    # Extract billing period end
+    period_end = None
+    bp = data.get('billing_period') or data.get('period') or {}
+    if isinstance(bp, dict):
+        period_end = (bp.get('end') or bp.get('end_date')
+                      or bp.get('period_end'))
+    return spend, period_end
+
+
 # ═══════════════════════════════════════════════════════
 # Auto-update
 # ═══════════════════════════════════════════════════════
@@ -1317,6 +1384,9 @@ class Section:
         self._dot_bg = BAR_BG        # colour behind the dot, for the fade-out
         self._dot_img = None         # keeps the current dot PhotoImage from GC
         self._reset_compact = False  # reduced reset sub-label for side-by-side bars
+        self._bar_text = None        # override bar face text (None = show pct%)
+        self._pace_pct = None        # white tick at this % of bar width (pace indicator)
+        self._pace_suffix = ''       # text appended to lbl_sub reset line
 
         self.frame = tk.Frame(parent, bg=BG)
         self.frame.pack(fill='x', padx=PAD, pady=(3, 0))
@@ -1390,8 +1460,9 @@ class Section:
         self._pct = max(0, min(100, pct))
         self._color = bar_color(self._pct, self.accent)
         cd = format_reset(resets_at, compact=self._reset_compact)
+        suffix = f'  ·  {self._pace_suffix}' if self._pace_suffix else ''
         if cd:
-            self.lbl_sub.config(text=cd)
+            self.lbl_sub.config(text=f'{cd}{suffix}')
         elif self._pct == 0:
             self.lbl_sub.config(text=t('not_used'))
         else:
@@ -1402,15 +1473,22 @@ class Section:
         if w < 2:
             return
         self.cv.delete('all')
-        pill(self.cv, 0, 0, w, BAR_H, BAR_BG)
+        pill_gradient(self.cv, 0, 0, w, BAR_H,
+                      _lerp_hex(BAR_BG, '#ffffff', 0.10),
+                      _lerp_hex(BAR_BG, '#000000', 0.12))
         if self._pct > 0:
             fw = max(BAR_H, w * self._pct / 100)
-            pill(self.cv, 0, 0, fw, BAR_H, self._color)
-        pct_str = f'{self._pct:.0f}%' if self._pct > 0 else '0%'
-        if self._compact and self._cd_txt:
-            txt = f'{pct_str}  {self._cd_txt}'
+            pill_gradient(self.cv, 0, 0, fw, BAR_H,
+                          _lerp_hex(self._color, '#ffffff', 0.22),
+                          _lerp_hex(self._color, '#000000', 0.18))
+        if self._pace_pct is not None:
+            tx = max(1, min(int(w * self._pace_pct / 100), w - 1))
+            self.cv.create_line(tx, 0, tx, BAR_H, fill='#ffffff', width=2)
+        if self._bar_text is not None:
+            txt = self._bar_text
         else:
-            txt = pct_str
+            pct_str = f'{self._pct:.0f}%' if self._pct > 0 else '0%'
+            txt = f'{pct_str}  {self._cd_txt}' if (self._compact and self._cd_txt) else pct_str
         self.cv.create_text(w / 2, BAR_H / 2 - 1, text=txt,
                             fill='#ffffff', font=FT_BAR, anchor='center')
         # Pre-refresh breathing dot, centred on the bar's right rounded cap
@@ -1483,6 +1561,8 @@ class Widget:
         self._dx = self._dy = 0
         self._expanded = False
         self._essential = False
+        self._docked = False
+        self._docked_tb = None  # cached (left, top, right, bottom, edge)
         self._rs_x = self._rs_y = self._rs_w = self._rs_h = 0
         self._menu_win = None
 
@@ -1575,6 +1655,7 @@ class Widget:
         self.root.update_idletasks()
         rh = self.root.winfo_reqheight()
         self.root.geometry(f'{w}x{rh}+{x}+{y}')
+        self._boot_collapsed_h = rh  # used as floor when collapsing
         self.root.minsize(MIN_W, 0)
 
         self.root.after(50, lambda: dwm_round(self.root, shadow=False))
@@ -1594,6 +1675,11 @@ class Widget:
         # Restore essential mode if it was active when last closed.
         if self.cfg.get('essential', False):
             self.root.after(100, self._restore_essential)
+        if self.cfg.get('taskbar_docked', False):
+            self.root.after(250, self._restore_docked)
+
+        if self.cfg.get('credit_balance'):
+            self._update_credits_bar()
 
         if self.cfg.get('session_key') and self.cfg.get('org_id'):
             self.refresh()
@@ -1704,6 +1790,9 @@ class Widget:
         self.content.pack(fill='both', expand=True)
 
         self.s_session = Section(self.content, t('current_session'), CLAUDE)
+        self.s_credits = Section(self.content, 'API Credits', CREDIT)
+        if not self.cfg.get('credit_balance'):
+            self.s_credits.frame.pack_forget()
 
         # Expandable sections
         self.extra_frame = tk.Frame(self.content, bg=BG)
@@ -1783,7 +1872,7 @@ class Widget:
         self.ess_close = tk.Label(self.ess_bar, text='\u2715', font=FT_EMOJI,
                                   fg=DIM, bg=BG, cursor='hand2',
                                   bd=0, highlightthickness=0, padx=4, pady=0)
-        self.ess_close.pack(side='left')
+        # Not packed \u2014 close is in the hamburger menu instead
         self.ess_close.bind('<Button-1>', lambda e: self._quit())
         self.ess_close.bind('<Enter>', lambda e: self.ess_close.config(fg=RED))
         self.ess_close.bind('<Leave>', lambda e: self.ess_close.config(fg=DIM))
@@ -1808,6 +1897,13 @@ class Widget:
         self.err_btn.bind('<Enter>', lambda e: self.err_btn.config(bg='#E08060'))
         self.err_btn.bind('<Leave>', lambda e: self.err_btn.config(bg=CLAUDE))
         self._err_action = None
+
+        # 1px edge lines so the widget is visible against the taskbar background
+        _edge = '#6a6a68'
+        self._border_l = tk.Frame(self.main, bg=_edge, width=1)
+        self._border_r = tk.Frame(self.main, bg=_edge, width=1)
+        self._border_l.place(x=0, y=0, relheight=1.0, width=1)
+        self._border_r.place(relx=1.0, x=-1, y=0, relheight=1.0, width=1)
 
     # ── Toggle expand/collapse ─────────────────────
 
@@ -1896,7 +1992,20 @@ class Widget:
         # to normal, then collapse): it restored essential's small height
         # instead of normal's. winfo_reqheight() always reflects current mode.
         end_h = self.root.winfo_reqheight()
-        end_y = bottom - end_h
+        if not self._expanded and self._docked:
+            tb_info = getattr(self, '_docked_tb', None)
+            if tb_info:
+                _, tb_top, _, tb_bottom, _ = tb_info
+                end_h = tb_bottom - tb_top
+                end_y = tb_top
+            else:
+                end_y = bottom - end_h
+            self.root.after(200, self._snap_to_taskbar)
+        elif not self._expanded:
+            end_h = max(end_h, getattr(self, '_boot_collapsed_h', end_h))
+            end_y = bottom - end_h
+        else:
+            end_y = bottom - end_h
         # Reset to the start height (the cover already hides the content) and
         # animate; _animate destroys the cover when it finishes.
         self.root.geometry(f'{self.root.winfo_width()}x{start_h}+{self.root.winfo_x()}+{start_y}')
@@ -1908,6 +2017,8 @@ class Widget:
     def _toggle_essential(self):
         if getattr(self, '_animating', False):
             return
+        if self._docked:
+            return  # mode locked while docked to taskbar
         wlog(f'MODE   toggle essential: {self._essential} -> {not self._essential}')
         start_h = self.root.winfo_height()
         start_y = self.root.winfo_y()
@@ -1941,6 +2052,8 @@ class Widget:
                 self._unbind_drag_section(sec)
         self.root.update_idletasks()
         end_h = self.root.winfo_reqheight()
+        if not self._expanded:
+            end_h = max(end_h, getattr(self, '_boot_collapsed_h', end_h))
         end_y = bottom - end_h
         self._update_minsize()
         # Cover content, reset to start, animate
@@ -1961,6 +2074,7 @@ class Widget:
         y = self.cfg.get('y', 100)
         self.root.update_idletasks()
         rh = self.root.winfo_reqheight()
+        self._boot_collapsed_h = rh
         self.root.geometry(f'{w}x{rh}+{x}+{y}')
         self.root.attributes('-alpha', 0.94)
         self._update_minsize()
@@ -2029,6 +2143,7 @@ class Widget:
         """
         bars = self._essential_bar_ids()
         self.s_session.frame.pack_forget()
+        self.s_credits.frame.pack_forget()
         self.extra_frame.pack_forget()
         self.bottom_pad.pack_forget()
         self.ess_menu.pack_forget()
@@ -2039,7 +2154,7 @@ class Widget:
         # Multi-bar: reserve the hamburger on the right first so the bars fill
         # the remaining width on the left (and the reset text clears the
         # bottom-right controls).
-        if n > 1:
+        if n > 1 or getattr(self, '_docked', False):
             self.ess_menu.pack(side='right', anchor='n', padx=(3, PAD),
                                pady=(top_pad, 0))
             self._draw_ess_menu(ESS_MENU_W)
@@ -2056,6 +2171,7 @@ class Widget:
         self.ess_row.pack(fill='x')
         self.bottom_pad.pack(fill='x')
         self._reassert_error_order()
+        self.root.wm_attributes('-transparentcolor', BG)
         # Re-render the bars with the reset-label form for this bar count.
         self._update_ess_bars(self._last_data)
         # Whole strip is draggable (Canvas skipped; right-click menu still
@@ -2074,7 +2190,10 @@ class Widget:
         self.ess_menu.pack_forget()
         self.ess_row.pack_forget()
         self.bottom_pad.pack_forget()
+        self.root.wm_attributes('-transparentcolor', '')
         self.s_session.frame.pack(fill='x', padx=PAD, pady=(3, 0))
+        if self.cfg.get('credit_balance'):
+            self.s_credits.frame.pack(fill='x', padx=PAD, pady=(3, 0))
         self.bottom_pad.pack(fill='x')
         self._reassert_error_order()
 
@@ -2147,6 +2266,8 @@ class Widget:
             self.root.geometry(f'{needed}x{h}+{x}+{y}')
 
     def _auto_height(self):
+        if self._docked:
+            return  # snap controls height; don't override with content height
         self.root.update_idletasks()
         x, y = self.root.winfo_x(), self.root.winfo_y()
         w = self.root.winfo_width()
@@ -2187,6 +2308,8 @@ class Widget:
         for tgt in self._countdown_targets():
             tgt.set_countdown('\u2022\u2022\u2022')
         threading.Thread(target=self._fetch, daemon=True).start()
+        if self.cfg.get('admin_api_key'):
+            threading.Thread(target=self._fetch_credits, daemon=True).start()
 
     def _fetch(self):
         wlog('FETCH  thread started')
@@ -2215,14 +2338,41 @@ class Widget:
     def _on_data(self, d):
         self._clear_error()
         fh = d.get('five_hour')
+        if fh and fh.get('resets_at'):
+            try:
+                reset_dt = datetime.fromisoformat(fh['resets_at'])
+                secs_left = (reset_dt - datetime.now(timezone.utc)).total_seconds()
+                window = 5 * 3600
+                elapsed = max(0.0, min(100.0, (window - secs_left) / window * 100))
+                self.s_session._pace_pct = elapsed
+                self.s_session._pace_suffix = f'{elapsed:.0f}% session'
+            except (ValueError, TypeError):
+                self.s_session._pace_pct = None
+                self.s_session._pace_suffix = ''
         self.s_session.update(fh['utilization'] if fh else None,
                               fh.get('resets_at') if fh else None)
         sd = d.get('seven_day')
+        if sd and sd.get('resets_at'):
+            try:
+                reset_dt = datetime.fromisoformat(sd['resets_at'])
+                secs_left = (reset_dt - datetime.now(timezone.utc)).total_seconds()
+                window = 7 * 24 * 3600
+                elapsed = max(0.0, min(100.0, (window - secs_left) / window * 100))
+                self.s_weekly._pace_pct = elapsed
+                self.s_weekly._pace_suffix = f'{elapsed:.0f}% week'
+            except (ValueError, TypeError):
+                self.s_weekly._pace_pct = None
+                self.s_weekly._pace_suffix = ''
         self.s_weekly.update(sd['utilization'] if sd else None,
                              sd.get('resets_at') if sd else None)
         ss = d.get('seven_day_sonnet')
         self.s_sonnet.update(ss['utilization'] if ss else None,
                              ss.get('resets_at') if ss else None)
+        # Mirror pace ticks onto the essential-row bar counterparts.
+        self.ess_bars['session']._pace_pct    = self.s_session._pace_pct
+        self.ess_bars['session']._pace_suffix = self.s_session._pace_suffix
+        self.ess_bars['weekly']._pace_pct     = self.s_weekly._pace_pct
+        self.ess_bars['weekly']._pace_suffix  = self.s_weekly._pace_suffix
         # Mirror the same data onto the essential-row bars (shown only in
         # collapsed essential mode, but kept in sync so the switch is instant).
         self._last_data = d
@@ -2567,26 +2717,310 @@ class Widget:
     def _drag_move(self, e):
         x = self.root.winfo_x() + e.x - self._dx
         y = self.root.winfo_y() + e.y - self._dy
+        if self._docked and self._docked_tb:
+            tb_left, _t, tb_right, _b, _e = self._docked_tb
+            x = max(tb_left, min(x, tb_right - self.root.winfo_width()))
+            y = self.root.winfo_y()  # lock vertical position
         self.root.geometry(f'+{x}+{y}')
 
     def _save_geometry(self, e=None):
         """Save current position, size, and mode to config."""
-        # Resting state is translucent; restore it after a resize drag (which
-        # turns the window opaque for smoothness) ends on this release.
         try:
-            self.root.attributes('-alpha', 0.94)
+            self.root.attributes('-alpha', 1.0 if self._docked else 0.94)
         except Exception:
             pass
         try:
-            self.cfg['x'] = self.root.winfo_x()
-            self.cfg['y'] = self.root.winfo_y()
-            self.cfg['width'] = self.root.winfo_width()
-            self.cfg['height'] = self.root.winfo_height()
+            if self._docked:
+                self.cfg['dock_x'] = self.root.winfo_x()
+            else:
+                self.cfg['x'] = self.root.winfo_x()
+                self.cfg['y'] = self.root.winfo_y()
+                self.cfg['width'] = self.root.winfo_width()
+                self.cfg['height'] = self.root.winfo_height()
             self.cfg['expanded'] = self._expanded
             self.cfg['essential'] = self._essential
+            self.cfg['taskbar_docked'] = self._docked
             save_cfg(self.cfg)
         except Exception as ex:
             wlog(f'SAVE   save_geometry error: {ex}')
+
+    # ── API Credits ──────────────────────────────────
+
+    def _fetch_credits(self):
+        """Fetch API spend in a background thread, post result to main thread."""
+        wlog('CREDITS fetch thread started')
+        try:
+            spend, period_end = fetch_api_credits(self.cfg['admin_api_key'])
+            wlog(f'CREDITS spend={spend:.4f} period_end={period_end}')
+            self.root.after(0, self._on_credits, spend, period_end)
+        except PermissionError as e:
+            wlog(f'CREDITS auth error: {e}')
+        except Exception as e:
+            wlog(f'CREDITS fetch error: {e}')
+
+    def _on_credits(self, spend, period_end):
+        """Update config and bar after a successful credits fetch."""
+        self.cfg['credit_spend'] = spend
+        save_cfg(self.cfg)
+        self._update_credits_bar(period_end)
+
+    def _update_credits_bar(self, period_end=None):
+        """Recalculate the credits bar from current config values."""
+        balance = float(self.cfg.get('credit_balance') or 0)
+        spend = float(self.cfg.get('credit_spend') or 0)
+        if balance <= 0:
+            return
+        remaining = max(0.0, balance - spend)
+        pct = min(100.0, spend / balance * 100)
+        remaining_pct = 100.0 - pct
+        self.s_credits._bar_text = f'{remaining_pct:.0f}% left'
+        self.s_credits.update(pct, None)
+        self.s_credits.lbl_info.config(text=f'${remaining:.2f} left')
+        self.s_credits.lbl_sub.config(
+            text=f'${remaining:.2f} of ${balance:.2f} remaining')
+
+    def _show_credits_bar(self):
+        """Insert and show the credits bar right after the session bar."""
+        if self.s_credits.frame.winfo_ismapped():
+            return
+        if self._essential and not self._expanded:
+            return  # not shown in collapsed essential
+        self.s_credits.frame.pack(fill='x', padx=PAD, pady=(3, 0),
+                                  after=self.s_session.frame)
+        self._auto_height()
+
+    def _hide_credits_bar(self):
+        """Hide the credits bar and shrink the widget."""
+        if not self.s_credits.frame.winfo_ismapped():
+            return
+        self.s_credits.frame.pack_forget()
+        self._auto_height()
+
+    def _admin_key_dialog(self):
+        """Dialog to enter or update the Admin API key."""
+        dw, dh = 460, 260
+        dlg, body = self._build_dialog_frame('API key', dw, dh)
+
+        tk.Label(body, text='Enter your Anthropic Admin API key.',
+                 font=FT_DLG_BODY, fg=DIM, bg=BG, anchor='w',
+                 wraplength=dw - 40).pack(fill='x', pady=(0, 14))
+        tk.Label(body, text='Admin API key (sk-ant-admin…)',
+                 font=FT_DLG_H, fg=FG, bg=BG, anchor='w').pack(fill='x')
+
+        entry_wrap = tk.Frame(body, bg=BAR_BG, padx=1, pady=1)
+        entry_wrap.pack(fill='x', pady=(8, 0))
+        entry = tk.Entry(entry_wrap, font=FT_DLG_BODY, bg=BAR_BG, fg=FG,
+                         insertbackground=FG, bd=0,
+                         highlightthickness=0, relief='flat')
+        entry.pack(fill='x', ipady=7, ipadx=10)
+        entry.bind('<FocusIn>',  lambda e: entry_wrap.configure(bg=FOCUS_RING))
+        entry.bind('<FocusOut>', lambda e: entry_wrap.configure(bg=BAR_BG))
+        if self.cfg.get('admin_api_key'):
+            entry.insert(0, self.cfg['admin_api_key'])
+        entry.focus_set()
+
+        status_lbl = tk.Label(body, text='', font=FT_DLG_HINT, fg=DIM, bg=BG,
+                              anchor='w', wraplength=dw - 40)
+        status_lbl.pack(fill='x', pady=(8, 0))
+
+        btn_frame = tk.Frame(body, bg=BG)
+        btn_frame.pack(fill='x', side='bottom', pady=(12, 0))
+
+        def save_key():
+            key = entry.get().strip().strip('"').strip("'")
+            if not key:
+                status_lbl.config(text='Paste your Admin API key above.', fg=RED)
+                return
+            if not key.startswith('sk-ant-'):
+                status_lbl.config(
+                    text='Key must start with sk-ant-', fg=RED)
+                return
+            had_key = bool(self.cfg.get('admin_api_key'))
+            self.cfg['admin_api_key'] = key
+            save_cfg(self.cfg)
+            dlg.destroy()
+            if not had_key:
+                self._show_credits_bar()
+            if self.cfg.get('credit_balance', 0):
+                threading.Thread(target=self._fetch_credits,
+                                 daemon=True).start()
+
+        self._secondary_pill(btn_frame, t('dlg_cancel'),
+                             dlg.destroy).pack(side='right', padx=(0, 8))
+        self._primary_pill(btn_frame, t('dlg_connect'),
+                           save_key).pack(side='right')
+        entry.bind('<Return>', lambda e: save_key())
+
+    def _credit_balance_dialog(self):
+        """Dialog to set the starting credit balance and current spend."""
+        dw, dh = 380, 300
+        dlg, body = self._build_dialog_frame(t('menu_credit_balance'), dw, dh)
+
+        def _make_entry(label_text, hint_text, prefill):
+            tk.Label(body, text=label_text,
+                     font=FT_DLG_H, fg=FG, bg=BG, anchor='w').pack(fill='x')
+            tk.Label(body, text=hint_text,
+                     font=FT_DLG_BODY, fg=DIM, bg=BG, anchor='w',
+                     wraplength=dw - 40).pack(fill='x', pady=(2, 6))
+            wrap = tk.Frame(body, bg=BAR_BG, padx=1, pady=1)
+            wrap.pack(fill='x')
+            e = tk.Entry(wrap, font=FT_DLG_BODY, bg=BAR_BG, fg=FG,
+                         insertbackground=FG, bd=0,
+                         highlightthickness=0, relief='flat')
+            e.pack(fill='x', ipady=7, ipadx=10)
+            e.bind('<FocusIn>',  lambda ev: wrap.configure(bg=FOCUS_RING))
+            e.bind('<FocusOut>', lambda ev: wrap.configure(bg=BAR_BG))
+            if prefill:
+                e.insert(0, str(prefill))
+            return e
+
+        entry_bal = _make_entry(
+            'Starting balance (USD)',
+            'Your total purchased credits — reset this when you add more.',
+            self.cfg.get('credit_balance', ''))
+        entry_bal.focus_set()
+
+        tk.Frame(body, bg=BAR_BG, height=1).pack(fill='x', pady=(10, 0))
+
+        entry_spend = _make_entry(
+            'Amount spent so far (USD)',
+            'Current spend against this balance. Leave 0 when resetting.',
+            self.cfg.get('credit_spend', ''))
+
+        status_lbl = tk.Label(body, text='', font=FT_DLG_HINT, fg=DIM, bg=BG,
+                              anchor='w')
+        status_lbl.pack(fill='x', pady=(6, 0))
+
+        btn_frame = tk.Frame(body, bg=BG)
+        btn_frame.pack(fill='x', side='bottom', pady=(12, 0))
+
+        def save_balance():
+            raw_bal = entry_bal.get().strip().lstrip('$')
+            raw_spend = entry_spend.get().strip().lstrip('$') or '0'
+            try:
+                bal = float(raw_bal)
+                if bal <= 0:
+                    raise ValueError
+            except ValueError:
+                status_lbl.config(text='Enter a positive dollar amount for balance.', fg=RED)
+                return
+            try:
+                spend = max(0.0, float(raw_spend))
+            except ValueError:
+                status_lbl.config(text='Enter a valid dollar amount for spend.', fg=RED)
+                return
+            self.cfg['credit_balance'] = bal
+            self.cfg['credit_spend'] = spend
+            save_cfg(self.cfg)
+            dlg.destroy()
+            self._show_credits_bar()
+            self._update_credits_bar()
+            if self.cfg.get('admin_api_key'):
+                threading.Thread(target=self._fetch_credits,
+                                 daemon=True).start()
+
+        self._secondary_pill(btn_frame, t('dlg_cancel'),
+                             dlg.destroy).pack(side='right', padx=(0, 8))
+        self._primary_pill(btn_frame, 'Save', save_balance).pack(side='right')
+        entry_bal.bind('<Return>', lambda e: entry_spend.focus_set())
+        entry_spend.bind('<Return>', lambda e: save_balance())
+
+    # ── Taskbar docking ──────────────────────────────
+
+    def _get_taskbar_info(self):
+        """Return (left, top, right, bottom, edge) for the primary taskbar via
+        SHAppBarMessage(ABM_GETTASKBARPOS), or None on failure.
+        edge: 0=left 1=top 2=right 3=bottom
+        """
+        class _RECT(ctypes.Structure):
+            _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                        ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+        class _APPBARDATA(ctypes.Structure):
+            _fields_ = [('cbSize', ctypes.c_uint), ('hWnd', ctypes.c_void_p),
+                        ('uCallbackMessage', ctypes.c_uint), ('uEdge', ctypes.c_uint),
+                        ('rc', _RECT), ('lParam', ctypes.c_long)]
+        try:
+            abd = _APPBARDATA()
+            abd.cbSize = ctypes.sizeof(_APPBARDATA)
+            if ctypes.windll.shell32.SHAppBarMessage(5, ctypes.byref(abd)):
+                r = abd.rc
+                return r.left, r.top, r.right, r.bottom, abd.uEdge
+        except Exception as ex:
+            wlog(f'DOCK   _get_taskbar_info: {ex}')
+        return None
+
+    def _snap_to_taskbar(self):
+        """Resize and position the widget to fill the taskbar strip exactly."""
+        info = self._get_taskbar_info()
+        if not info:
+            wlog('DOCK   no taskbar info — snap skipped')
+            return
+        tb_left, tb_top, tb_right, tb_bottom, tb_edge = info
+        self._docked_tb = info
+        tb_h = tb_bottom - tb_top
+        ww = self.root.winfo_width()
+        saved_x = self.cfg.get('dock_x', tb_right - ww - 220)
+        wx = max(tb_left, min(saved_x, tb_right - ww))
+        wy = tb_top
+        self.root.geometry(f'{ww}x{tb_h}+{wx}+{wy}')
+        wlog(f'DOCK   snap {ww}x{tb_h}+{wx}+{wy}  tb={tb_left},{tb_top},{tb_right},{tb_bottom} edge={tb_edge}')
+
+    def _apply_dock_corners(self, round_=False):
+        """Set DWM corner style: square when docked, rounded when floating."""
+        try:
+            hwnd = getattr(self, '_hwnd', None)
+            if hwnd:
+                val = ctypes.c_int(2 if round_ else 1)  # ROUND=2 DONOTROUND=1
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 33, ctypes.byref(val), ctypes.sizeof(val))
+        except Exception:
+            pass
+
+    def _toggle_dock(self):
+        if self._docked:
+            self._undock()
+        else:
+            self._dock()
+
+    def _dock(self):
+        wlog('DOCK   entering docked mode')
+        self._docked = True
+        self.cfg['taskbar_docked'] = True
+        if not self._essential:
+            self._toggle_essential()
+            self.root.after(150, self._finish_dock)
+        else:
+            self.root.after(30, self._finish_dock)
+
+    def _finish_dock(self):
+        self._snap_to_taskbar()
+        self.root.attributes('-alpha', 1.0)
+        self._apply_dock_corners(round_=False)
+        save_cfg(self.cfg)
+
+    def _undock(self):
+        wlog('DOCK   leaving docked mode')
+        self._docked = False
+        self._docked_tb = None
+        self.cfg['taskbar_docked'] = False
+        self.root.attributes('-alpha', 0.94)
+        self._apply_dock_corners(round_=True)
+        x = self.cfg.get('x', 100)
+        y = self.cfg.get('y', 100)
+        self.root.geometry(f'+{x}+{y}')
+        save_cfg(self.cfg)
+
+    def _restore_docked(self):
+        """Restore docked mode on startup without animation."""
+        wlog('DOCK   restoring docked mode')
+        self._docked = True
+        if not self._essential:
+            self._restore_essential()
+        elif not self._expanded:
+            self._enter_ess_collapsed()  # redo layout now that _docked is True
+        self._snap_to_taskbar()
+        self.root.attributes('-alpha', 1.0)
+        self._apply_dock_corners(round_=False)
 
     # ── Shared dialog / popup helpers ───────────────
 
@@ -2805,6 +3239,7 @@ class Widget:
         taskbar_on = self.cfg.get('show_in_taskbar', False)
         taskbar_label = (t('menu_taskbar_on') if taskbar_on
                          else t('menu_taskbar_off'))
+        dock_label = t('menu_undock') if self._docked else t('menu_dock')
         cd_mode = self.cfg.get('countdown_display', 'dot')
         cd_name = {'full': t('countdown_full'),
                    'hidden': t('countdown_hidden'),
@@ -2833,10 +3268,13 @@ class Widget:
             ('\u23F3\uFE0E',       FT_EMOJI,     interval_label,           self._show_interval_dialog),
             ('\U0001F514\uFE0E',   FT_EMOJI,     notif_label,              self._toggle_notifications),
             ('\U0001F4CC\uFE0E',   FT_EMOJI,     taskbar_label,            self._toggle_taskbar),
+            ('\u21A7\uFE0E',       FT_EMOJI_11,  dock_label,               self._toggle_dock),
             ('\u23F1\uFE0E',       FT_EMOJI,     countdown_label,          self._show_countdown_menu),
             ('\uD83D\uDD52\uFE0E',       FT_EMOJI,     sync_label,               self._toggle_sync_time),
             ('\U0001F4CA\uFE0E',   FT_EMOJI,     t('menu_essential_bars'), self._show_essential_bars_menu),
             ('\U0001F5DD\uFE0E',   FT_EMOJI,     t('menu_renew'),          self._renew_session),
+            ('\U0001F511\uFE0E',   FT_EMOJI,     t('menu_admin_key'),      self._admin_key_dialog),
+            ('\U0001F4B0\uFE0E',   FT_EMOJI,     t('menu_credit_balance'), self._credit_balance_dialog),
             ('\u2197\uFE0E',       FT_EMOJI,     t('menu_open_claude'),    self._open_claude_usage),
             (gh_icon,              gh_font,      t('menu_open_repo'),      self._open_repo),
             ('{ }',                FT_EMOJI,     t('menu_open_config'),    self._open_config),
