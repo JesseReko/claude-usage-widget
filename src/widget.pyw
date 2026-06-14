@@ -29,6 +29,7 @@ import math
 import ssl
 import time
 import ctypes
+import ctypes.wintypes
 import signal
 import atexit
 import tempfile
@@ -2949,20 +2950,34 @@ class Widget:
         return None
 
     def _snap_to_taskbar(self):
-        """Resize and position the widget to fill the taskbar strip exactly."""
-        info = self._get_taskbar_info()
-        if not info:
-            wlog('DOCK   no taskbar info — snap skipped')
-            return
-        tb_left, tb_top, tb_right, tb_bottom, tb_edge = info
-        self._docked_tb = info
-        tb_h = tb_bottom - tb_top
+        """Position the widget at the bottom-left of the screen using only Tk
+        coordinates — no Win32 absolute pixel values that break under DPI scaling.
+
+        Taskbar height is derived from SPI_GETWORKAREA, which is a relative
+        calculation (screen_h - work_bottom) so the DPI units cancel whether
+        the process is DPI-aware or not.
+        """
+        sh = self.root.winfo_screenheight()
         ww = self.root.winfo_width()
-        saved_x = self.cfg.get('dock_x', tb_right - ww - 220)
-        wx = max(tb_left, min(saved_x, tb_right - ww))
-        wy = tb_top
+
+        try:
+            SPI_GETWORKAREA = 0x0030
+            work = ctypes.wintypes.RECT()
+            ctypes.windll.user32.SystemParametersInfoW(
+                SPI_GETWORKAREA, 0, ctypes.byref(work), 0)
+            # Relative height — same coordinate space as sh regardless of DPI
+            tb_h = max(30, sh - work.bottom)
+        except Exception as ex:
+            wlog(f'DOCK   SPI_GETWORKAREA failed: {ex} — using 48px fallback')
+            tb_h = 48
+
+        sw = self.root.winfo_screenwidth()
+        wx = 0           # bottom-left
+        wy = sh - tb_h
+        # Store screen-based bounds so _drag_move can clamp X and lock Y
+        self._docked_tb = (0, wy, sw, sh, 3)
         self.root.geometry(f'{ww}x{tb_h}+{wx}+{wy}')
-        wlog(f'DOCK   snap {ww}x{tb_h}+{wx}+{wy}  tb={tb_left},{tb_top},{tb_right},{tb_bottom} edge={tb_edge}')
+        wlog(f'DOCK   snap {ww}x{tb_h}+{wx}+{wy}  sh={sh} tb_h={tb_h}')
 
     def _apply_dock_corners(self, round_=False):
         """Set DWM corner style: square when docked, rounded when floating."""
@@ -2983,13 +2998,11 @@ class Widget:
 
     def _dock(self):
         wlog('DOCK   entering docked mode')
-        self._docked = True
         self.cfg['taskbar_docked'] = True
         if not self._essential:
-            self._toggle_essential()
-            self.root.after(150, self._finish_dock)
-        else:
-            self.root.after(30, self._finish_dock)
+            self._restore_essential()  # instant layout, no animation to override the snap
+        self._docked = True
+        self.root.after(30, self._finish_dock)
 
     def _finish_dock(self):
         self._snap_to_taskbar()
