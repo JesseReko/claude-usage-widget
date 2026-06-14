@@ -114,7 +114,7 @@ PCT_FG   = '#ffffff'
 MENU_BG  = '#2c2c2a'
 
 # ─── App ────────────────────────────────────────────
-APP_VERSION = '2.8.44'
+APP_VERSION = '2.8.45'
 
 # ─── Auto-update ────────────────────────────────────
 UPDATE_REPO = 'JesseReko/claude-usage-widget'
@@ -2171,7 +2171,6 @@ class Widget:
         self.ess_row.pack(fill='x')
         self.bottom_pad.pack(fill='x')
         self._reassert_error_order()
-        self.root.wm_attributes('-transparentcolor', BG)
         # Re-render the bars with the reset-label form for this bar count.
         self._update_ess_bars(self._last_data)
         # Whole strip is draggable (Canvas skipped; right-click menu still
