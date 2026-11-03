@@ -229,6 +229,7 @@ def write_crash(tag, tb):
 def wlog(msg):
     """Append a timestamped line to widget.log, truncating when over MAX_LOG_LINES."""
     global _log_count
+    msg = re.sub(r'sk-ant-[\w-]+', 'sk-ant-***', str(msg))  # never log a credential
     line = f'{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n'
     try:
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
@@ -483,6 +484,7 @@ LANG = {
         'empty_response': 'Empty response',
         'no_org': 'No organization found',
         'session_expired_short': 'Session expired',
+        'session_expired_bar': 'Session expired, click to renew',
         'action_setup_now': 'Configure now',
         'action_renew_now': 'Renew session',
         # Toast notifications
@@ -574,6 +576,7 @@ LANG = {
         'empty_response': 'Risposta vuota',
         'no_org': 'Nessuna organizzazione trovata',
         'session_expired_short': 'Sessione scaduta',
+        'session_expired_bar': 'Sessione scaduta, clicca per rinnovare',
         'action_setup_now': 'Configura ora',
         'action_renew_now': 'Rinnova sessione',
         'toast_title': 'Claude Usage',
@@ -656,6 +659,7 @@ LANG = {
         'empty_response': '\u5fdc\u7b54\u304c\u7a7a\u3067\u3059',
         'no_org': '\u7d44\u7e54\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093',
         'session_expired_short': '\u30bb\u30c3\u30b7\u30e7\u30f3\u6709\u52b9\u671f\u5207\u308c',
+        'session_expired_bar': '\u30bb\u30c3\u30b7\u30e7\u30f3\u6709\u52b9\u671f\u5207\u308c\u3002\u30af\u30ea\u30c3\u30af\u3057\u3066\u66f4\u65b0',
         'action_setup_now': '\u4eca\u3059\u3050\u8a2d\u5b9a',
         'action_renew_now': '\u30bb\u30c3\u30b7\u30e7\u30f3\u66f4\u65b0',
         'toast_title': 'Claude Usage',
@@ -1113,15 +1117,12 @@ def _curl_get(url, session_key):
     Edge/Chrome use - so the JA3 matches a real browser. Schannel also
     uses the system CA store, so cert validation matches the browser.
     """
-    result = subprocess.run(
-        ['curl', '-s',
-         '-H', f'Cookie: sessionKey={session_key}',
-         '-H', f'User-Agent: {_BROWSER_UA}',
-         '-H', 'anthropic-client-platform: web_claude_ai',
-         url],
-        capture_output=True, text=True, timeout=20,
-        creationflags=subprocess.CREATE_NO_WINDOW
-    )
+    result = run_curl(
+        '-s',
+        '-H', f'Cookie: sessionKey={session_key}',
+        '-H', f'User-Agent: {_BROWSER_UA}',
+        '-H', 'anthropic-client-platform: web_claude_ai',
+        url)
     if result.returncode != 0:
         raise RuntimeError(f'curl: {result.stderr.strip()}')
     body = result.stdout.strip()
@@ -1172,19 +1173,44 @@ def fetch_org_id(session_key):
     return orgs[0].get('uuid') or orgs[0].get('id')
 
 
+def run_curl(*args):
+    """Run curl with a 20s timeout. A timeout's default message contains the
+    full command, credentials included, so it is replaced with a plain one."""
+    try:
+        return subprocess.run(
+            ['curl', *args],
+            capture_output=True, text=True, timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('Request timed out') from None
+
+
+def rotated_session_key(headers, current):
+    """Return a new session key from response headers, or None.
+
+    Only a real Set-Cookie for sessionKey counts. The server ends a session by
+    sending sessionKey="", which must never replace a saved key.
+    """
+    for line in headers.splitlines():
+        m = re.match(r'set-cookie:\s*sessionKey=([^;\s]+)', line, re.IGNORECASE)
+        if m:
+            key = m.group(1)
+            if key.startswith('sk-ant-') and key != current:
+                return key
+    return None
+
+
 def fetch_usage(cfg):
     """Fetch usage data from Claude.ai API. See fetch_org_id for why curl."""
     url = API_URL.format(cfg['org_id'])
     cookie = f"sessionKey={cfg['session_key']}; lastActiveOrg={cfg['org_id']}"
-    result = subprocess.run(
-        ['curl', '-s', '-D', '-',
-         '-H', f'Cookie: {cookie}',
-         '-H', f'User-Agent: {_BROWSER_UA}',
-         '-H', 'anthropic-client-platform: web_claude_ai',
-         url],
-        capture_output=True, text=True, timeout=20,
-        creationflags=subprocess.CREATE_NO_WINDOW
-    )
+    result = run_curl(
+        '-s', '-D', '-',
+        '-H', f'Cookie: {cookie}',
+        '-H', f'User-Agent: {_BROWSER_UA}',
+        '-H', 'anthropic-client-platform: web_claude_ai',
+        url)
     if result.returncode != 0:
         raise RuntimeError(f'curl: {result.stderr.strip()}')
     parts = result.stdout.split('\r\n\r\n', 1)
@@ -1201,9 +1227,9 @@ def fetch_usage(cfg):
             raise PermissionError(t('session_expired_short'))
         if code >= 400:
             raise RuntimeError(f'HTTP {code}')
-    km = re.search(r'sessionKey=([^;\s]+)', headers)
-    if km and km.group(1) != cfg.get('session_key'):
-        cfg['session_key'] = km.group(1)
+    new_key = rotated_session_key(headers, cfg.get('session_key'))
+    if new_key:
+        cfg['session_key'] = new_key
         save_cfg(cfg)
     try:
         return json.loads(body)
@@ -1217,14 +1243,11 @@ def fetch_api_credits(admin_api_key):
     Uses the Anthropic Admin API cost report endpoint. Returns
     (spend_usd: float, period_end: str|None). Raises on failure.
     """
-    result = subprocess.run(
-        ['curl', '-s',
-         '-H', f'x-api-key: {admin_api_key}',
-         '-H', 'anthropic-version: 2023-06-01',
-         'https://api.anthropic.com/v1/organizations/cost_report/messages'],
-        capture_output=True, text=True, timeout=20,
-        creationflags=subprocess.CREATE_NO_WINDOW
-    )
+    result = run_curl(
+        '-s',
+        '-H', f'x-api-key: {admin_api_key}',
+        '-H', 'anthropic-version: 2023-06-01',
+        'https://api.anthropic.com/v1/organizations/cost_report/messages')
     if result.returncode != 0:
         raise RuntimeError(f'curl: {result.stderr.strip()}')
     body = result.stdout.strip()
@@ -1899,6 +1922,15 @@ class Widget:
         self.err_btn.bind('<Leave>', lambda e: self.err_btn.config(bg=CLAUDE))
         self._err_action = None
 
+        # The error panel sits below the bars, outside the height of the
+        # docked/essential strip, so an expired session gets its own banner
+        # over the strip. Right-click still opens the menu via the root binding.
+        self.session_banner = tk.Label(self.main, text='', font=FT_B, fg=BG,
+                                       bg=CLAUDE, cursor='hand2')
+        self.session_banner.bind('<Button-1>', lambda e: self._renew_session())
+        self.session_banner.bind('<Enter>', lambda e: self.session_banner.config(bg='#E08060'))
+        self.session_banner.bind('<Leave>', lambda e: self.session_banner.config(bg=CLAUDE))
+
         # 1px edge lines so the widget is visible against the taskbar background
         _edge = '#6a6a68'
         self._border_l = tk.Frame(self.main, bg=_edge, width=1)
@@ -2042,6 +2074,7 @@ class Widget:
             self.s_weekly.set_compact(False)
             self.s_sonnet.set_compact(False)
             self.ess_bar.place_forget()
+            self.session_banner.place_forget()  # full view shows the error panel
             self.content.pack_forget()
             self.tb.pack(fill='x')
             self.sep.pack(fill='x')
@@ -2308,8 +2341,13 @@ class Widget:
         for tgt in self._countdown_targets():
             tgt.set_countdown('\u2022\u2022\u2022')
         threading.Thread(target=self._fetch, daemon=True).start()
-        if self.cfg.get('admin_api_key'):
+        if self._has_admin_key():
             threading.Thread(target=self._fetch_credits, daemon=True).start()
+
+    def _has_admin_key(self):
+        """The cost report endpoint only accepts Admin API keys, so a regular
+        sk-ant-api key would fail on every refresh."""
+        return str(self.cfg.get('admin_api_key', '')).startswith('sk-ant-admin')
 
     def _fetch(self):
         wlog('FETCH  thread started')
@@ -2664,6 +2702,7 @@ class Widget:
 
     def _clear_error(self):
         """Hide the error panel and drop any pending action binding."""
+        self.session_banner.place_forget()
         self.err_btn.pack_forget()
         self.err_frame.pack_forget()
         if self._err_action is not None:
@@ -2690,6 +2729,12 @@ class Widget:
             self.err_btn.bind('<Button-1>', lambda e: action_cmd())
             self.err_btn.pack(anchor='w', padx=PAD, pady=(0, 4))
         self.err_frame.pack(fill='x', pady=(4, 0))
+        if action_cmd == self._renew_session and (self._docked or self._essential):
+            self.session_banner.config(text=t('session_expired_bar'))
+            self.session_banner.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+            self.session_banner.lift()
+        else:
+            self.session_banner.place_forget()
         self._set_pulse(False)
         self._apply_dot_phase('off')
         for tgt in self._countdown_targets():
@@ -2915,7 +2960,7 @@ class Widget:
             dlg.destroy()
             self._show_credits_bar()
             self._update_credits_bar()
-            if self.cfg.get('admin_api_key'):
+            if self._has_admin_key():
                 threading.Thread(target=self._fetch_credits,
                                  daemon=True).start()
 
